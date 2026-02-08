@@ -57,7 +57,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         # 2. Connect to Google
         async with client.aio.live.connect(model=MODEL, config=config) as session:
-            logger.info(f"Connected to Gemini Live Session: {session.session_id}")
+            logger.info(f"Connected to Gemini Live Session")
             
             # --- Task A: Upstream (Client -> Server -> Gemini) ---
             async def upstream_handler():
