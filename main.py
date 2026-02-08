@@ -24,7 +24,7 @@ app.add_middleware(
 
 # Configuration
 API_KEY = os.environ.get("GOOGLE_API_KEY")
-MODEL = "gemini-2.0-flash-exp" 
+MODEL = "gemini-2.5-flash-native-audio-preview-12-2025" 
 
 if not API_KEY:
     logger.error("CRITICAL: GOOGLE_API_KEY not found in environment variables!")
