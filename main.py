@@ -68,15 +68,20 @@ async def websocket_endpoint(websocket: WebSocket):
                         message = await websocket.receive()
                         
                         if "bytes" in message and message["bytes"]:
-                            # Forward Audio Data (Raw PCM)
-                            await session.send(input={"data": message["bytes"], "mime_type": "audio/pcm"}, end_of_turn=False)
+                            # Forward Audio Data (Raw PCM) using send_realtime_input
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=message["bytes"], mime_type="audio/pcm;rate=16000")
+                            )
                         
                         elif "text" in message and message["text"]:
                             # Forward Text/Control Messages
                             try:
                                 data = json.loads(message["text"])
                                 if data.get("type") == "text_input":
-                                    await session.send(input=data["content"], end_of_turn=True)
+                                    await session.send_client_content(
+                                        turns={"role": "user", "parts": [{"text": data["content"]}]},
+                                        turn_complete=True
+                                    )
                             except:
                                 pass # Ignore malformed text
                 except WebSocketDisconnect:
