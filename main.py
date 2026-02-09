@@ -1,19 +1,28 @@
 import os
 import asyncio
-import json
 import logging
+import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
-from google.genai import types
+from google.genai.types import LiveConnectConfig, PrebuiltVoiceConfig, VoiceConfig
 
-# Configure Logging
+# --- CONFIGURATION ---
+API_KEY = os.environ.get("GEMINI_API_KEY")
+if not API_KEY:
+    raise ValueError("❌ GEMINI_API_KEY not found! Set this in Railway variables.")
+
+# Use the latest model ID from your docs
+MODEL_ID = "	gemini-2.5-flash-native-audio-preview-12-2025" 
+
+# --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("GeminiLiveBridge")
+logger = logging.getLogger("GeminiBridge")
 
+# --- APP SETUP ---
 app = FastAPI()
 
-# Allow CORS for local testing
+# 1. GLOBAL CORS FIX (Crucial for Hugging Face)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,105 +31,104 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
-API_KEY = os.environ.get("GOOGLE_API_KEY")
-MODEL = "gemini-2.5-flash-native-audio-preview-12-2025" 
+# --- ROUTES ---
 
-if not API_KEY:
-    logger.error("CRITICAL: GOOGLE_API_KEY not found in environment variables!")
-
-# Initialize Gemini Client
-client = genai.Client(api_key=API_KEY, http_options={'api_version': 'v1alpha'})
-
-@app.get("/health")
+@app.get("/")
 async def health_check():
-    return {"status": "ok", "model": MODEL}
+    """Simple health check to verify server is running."""
+    return {"status": "online", "service": "Gemini Live Bridge", "model": MODEL_ID}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """
+    Bi-directional Bridge:
+    Client (Hugging Face) <-> Railway <-> Gemini Live API
+    """
     await websocket.accept()
-    logger.info("Client connected to WebSocket")
+    logger.info("🔌 Client Connected via WebSocket")
 
-    # 1. Configure Gemini Live Session
-    # Requesting AUDIO output for the avatar
-    config = types.LiveConnectConfig(
-        response_modalities=["AUDIO"], 
-        speech_config=types.SpeechConfig(
-            voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                    voice_name="Aoede"
-                )
-            )
-        )
-    )
+    # Initialize Gemini Client (using v1alpha as per advanced docs for best features)
+    client = genai.Client(api_key=API_KEY, http_options={"api_version": "v1alpha"})
+
+    # Configure the Live Session
+    # We ask for AUDIO response and set a specific voice.
+    config = {
+        "response_modalities": ["AUDIO"],
+        "speech_config": {
+            "voice_config": PrebuiltVoiceConfig(voice_name="Puck")
+        }
+    }
 
     try:
-        # 2. Connect to Google
-        async with client.aio.live.connect(model=MODEL, config=config) as session:
-            logger.info(f"Connected to Gemini Live Session")
-            
-            # --- Task A: Upstream (Client -> Server -> Gemini) ---
-            async def upstream_handler():
+        # Connect to Gemini Live
+        async with client.aio.live.connect(model=MODEL_ID, config=config) as session:
+            logger.info(f"✨ Connected to Gemini Live ({MODEL_ID})")
+
+            # --- TASK A: Receive Audio from Client -> Send to Gemini ---
+            async def receive_from_client():
                 try:
                     while True:
-                        # Receive message from Client (Linly)
-                        # Expecting raw bytes for audio
-                        message = await websocket.receive()
+                        # 1. Receive raw PCM bytes from Hugging Face
+                        data = await websocket.receive_bytes()
+                        if not data:
+                            break
                         
-                        if "bytes" in message and message["bytes"]:
-                            # Forward Audio Data (Raw PCM) using send_realtime_input
-                            await session.send_realtime_input(
-                                audio=types.Blob(data=message["bytes"], mime_type="audio/pcm;rate=16000")
-                            )
-                        
-                        elif "text" in message and message["text"]:
-                            # Forward Text/Control Messages
-                            try:
-                                data = json.loads(message["text"])
-                                if data.get("type") == "text_input":
-                                    await session.send_client_content(
-                                        turns={"role": "user", "parts": [{"text": data["content"]}]},
-                                        turn_complete=True
-                                    )
-                            except:
-                                pass # Ignore malformed text
+                        # 2. Send to Gemini
+                        # We send "end_of_turn=False" to let Gemini's VAD decide when to reply
+                        await session.send(
+                            input={"data": data, "mime_type": "audio/pcm"}, 
+                            end_of_turn=False 
+                        )
                 except WebSocketDisconnect:
-                    logger.info("Client disconnected (Upstream)")
-                    raise
+                    logger.info("⚠️ Client Disconnected (Receive Loop)")
                 except Exception as e:
-                    logger.error(f"Upstream Error: {e}")
+                    logger.error(f"❌ Error receiving from client: {e}")
 
-            # --- Task B: Downstream (Gemini -> Server -> Client) ---
-            async def downstream_handler():
+            # --- TASK B: Receive Audio from Gemini -> Send to Client ---
+            async def send_to_client():
                 try:
                     while True:
+                        # 1. Iterate through the session generator
                         async for response in session.receive():
-                            # 1. Audio Data
-                            if response.data:
-                                # Forward raw bytes directly to client
-                                await websocket.send_bytes(response.data)
-                            
-                            # 2. Text/Transcript Data (Optional)
-                            if response.text:
-                                payload = json.dumps({
-                                    "type": "text",
-                                    "content": response.text
-                                })
-                                await websocket.send_text(payload)
-                                
-                            # 3. Turn Complete Signal
-                            if response.server_content and response.server_content.turn_complete:
-                                await websocket.send_text(json.dumps({"type": "turn_complete"}))
-                                
-                except Exception as e:
-                    logger.error(f"Downstream Error: {e}")
+                            server_content = response.server_content
+                            if server_content is None:
+                                continue
 
-            # Run both tasks until one fails/disconnects
-            await asyncio.gather(upstream_handler(), downstream_handler())
+                            # 2. Handle Audio Output (Model Turn)
+                            if server_content.model_turn:
+                                for part in server_content.model_turn.parts:
+                                    # Check for inline_data (Audio bytes)
+                                    if part.inline_data and part.inline_data.data:
+                                        # Send raw audio bytes back to Hugging Face
+                                        await websocket.send_bytes(part.inline_data.data)
+
+                            # 3. Handle Interruption (User spoke while model was talking)
+                            if server_content.interrupted:
+                                logger.info("🛑 Gemini was interrupted by user")
+                                # Optional: Send a text flag to client to clear audio buffer
+                                # await websocket.send_text("INTERRUPTED")
+
+                            # 4. Handle Turn Complete
+                            if server_content.turn_complete:
+                                logger.info("✅ Gemini Turn Complete")
+                except Exception as e:
+                    logger.error(f"❌ Error receiving from Gemini: {e}")
+
+            # --- RUN LOOPS CONCURRENTLY ---
+            # Using wait allows us to stop if either side disconnects
+            await asyncio.wait(
+                [asyncio.create_task(receive_from_client()), 
+                 asyncio.create_task(send_to_client())],
+                return_when=asyncio.FIRST_COMPLETED
+            )
 
     except Exception as e:
-        logger.error(f"Session Error: {e}")
+        logger.error(f"🔥 Bridge Error: {e}")
+        # Try to send error to client if still connected
         try:
-            await websocket.close(code=1011)
+            await websocket.send_text(f"Error: {str(e)}")
+            await websocket.close()
         except:
             pass
+    finally:
+        logger.info("👋 Connection Closed")
